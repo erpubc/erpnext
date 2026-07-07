@@ -22,7 +22,62 @@ from erpnext.accounts.doctype.budget.budget import validate_expense_against_budg
 from erpnext.accounts.utils import create_payment_ledger_entry, is_immutable_ledger_enabled
 from erpnext.exceptions import InvalidAccountDimensionError, MandatoryAccountDimensionError
 
+def allow_closed_period_bypass_for_asset_split_reallocation(gl_entries):
+	"""
+	Allow closed-period GL repost only for ERPNext Asset Split depreciation reallocation.
 
+	This covers BOTH:
+	- Accounting Period closed-document validation
+	- Period Closing Voucher validation
+
+	It must only apply when:
+	- voucher is Journal Entry
+	- JE voucher_type is Depreciation Entry
+	- voucher_no matches the exact JE in frappe.flags.asset_split_closed_period_reallocation
+	- new_asset.split_from == old_asset
+	"""
+	ctx = getattr(frappe.flags, "asset_split_closed_period_reallocation", None)
+
+	if not ctx:
+		return False
+
+	if not gl_entries:
+		return False
+
+	first = gl_entries[0]
+
+	voucher_type = first.get("voucher_type")
+	voucher_no = first.get("voucher_no")
+
+	if voucher_type != "Journal Entry":
+		return False
+
+	if voucher_no != ctx.get("journal_entry"):
+		return False
+
+	old_asset = ctx.get("old_asset")
+	new_asset = ctx.get("new_asset")
+
+	if not old_asset or not new_asset:
+		return False
+
+	for gle in gl_entries:
+		if gle.get("voucher_type") != voucher_type:
+			return False
+		if gle.get("voucher_no") != voucher_no:
+			return False
+		if gle.get("company") != first.get("company"):
+			return False
+
+	je_voucher_type = frappe.db.get_value("Journal Entry", voucher_no, "voucher_type")
+	if je_voucher_type != "Depreciation Entry":
+		return False
+
+	split_from = frappe.db.get_value("Asset", new_asset, "split_from")
+	if split_from != old_asset:
+		return False
+
+	return True
 def make_gl_entries(
 	gl_map,
 	cancel=False,
@@ -34,7 +89,8 @@ def make_gl_entries(
 	if gl_map:
 		if not cancel:
 			make_acc_dimensions_offsetting_entry(gl_map)
-			validate_accounting_period(gl_map)
+			if not allow_closed_period_bypass_for_asset_split_reallocation(gl_map):
+				validate_accounting_period(gl_map)
 			validate_disabled_accounts(gl_map)
 			gl_map = process_gl_map(gl_map, merge_entries, from_repost=from_repost)
 			if gl_map and len(gl_map) > 1:
@@ -399,8 +455,8 @@ def save_entries(gl_map, adv_adj, update_outstanding, from_repost=False):
 		check_freezing_date(gl_map[0]["posting_date"], adv_adj)
 		is_opening = any(d.get("is_opening") == "Yes" for d in gl_map)
 		if gl_map[0]["voucher_type"] != "Period Closing Voucher":
-			validate_against_pcv(is_opening, gl_map[0]["posting_date"], gl_map[0]["company"])
-
+			if not allow_closed_period_bypass_for_asset_split_reallocation(gl_map):
+				validate_against_pcv(is_opening, gl_map[0]["posting_date"], gl_map[0]["company"])
 	for entry in gl_map:
 		validate_allowed_dimensions(entry, dimension_filter_map)
 		make_entry(entry, adv_adj, update_outstanding, from_repost)
@@ -696,7 +752,8 @@ def make_reverse_gl_entries(
 			update_outstanding=update_outstanding,
 			partial_cancel=partial_cancel,
 		)
-		validate_accounting_period(gl_entries)
+		if not allow_closed_period_bypass_for_asset_split_reallocation(gl_entries):
+			validate_accounting_period(gl_entries)
 		check_freezing_date(gl_entries[0]["posting_date"], adv_adj)
 
 		is_opening = any(d.get("is_opening") == "Yes" for d in gl_entries)
@@ -704,7 +761,8 @@ def make_reverse_gl_entries(
 		# For reverse entries, use the posting_date parameter if provided and valid
 		# Otherwise fall back to original posting_date
 		validation_date = posting_date if posting_date else gl_entries[0]["posting_date"]
-		validate_against_pcv(is_opening, validation_date, gl_entries[0]["company"])
+		if not allow_closed_period_bypass_for_asset_split_reallocation(gl_entries):
+			validate_against_pcv(is_opening, validation_date, gl_entries[0]["company"])
 
 		if partial_cancel:
 			# Partial cancel is only used by `Advance` in separate account feature.
