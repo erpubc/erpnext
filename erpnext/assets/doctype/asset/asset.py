@@ -1399,44 +1399,370 @@ def create_new_asset_after_split(asset, split_qty):
 	return new_asset
 
 
+# =============================================================================
+# UBC PATCH: Asset Split - Closed-Period Safe Zero-Impact Depreciation Reallocation
+# =============================================================================
+
+def _get_accounting_dimension_fields_for_asset_split():
+	try:
+		return frappe.get_all(
+			"Accounting Dimension",
+			filters={"disabled": 0},
+			pluck="fieldname",
+		)
+	except Exception:
+		return []
+
+
+def _asset_split_amount_side(row):
+	if flt(row.debit):
+		return "debit"
+	if flt(row.credit):
+		return "credit"
+	return None
+
+
+def _asset_split_row_amount(row):
+	side = _asset_split_amount_side(row)
+	return flt(row.get(side)) if side else 0
+
+
+def _asset_split_row_amount_in_account_currency(row):
+	side = _asset_split_amount_side(row)
+
+	if side == "debit":
+		return flt(row.debit_in_account_currency)
+	if side == "credit":
+		return flt(row.credit_in_account_currency)
+
+	return 0
+
+
+def _asset_split_validate_exchange_rate(row):
+	if not flt(row.exchange_rate):
+		frappe.throw(
+			_(
+				"Unsafe Asset Split blocked. Journal Entry row {0} has missing or zero exchange rate."
+			).format(row.idx)
+		)
+
+
+def _asset_split_row_identity(row):
+	dimension_fields = _get_accounting_dimension_fields_for_asset_split()
+
+	base_fields = [
+		"account",
+		"cost_center",
+		"project",
+		"finance_book",
+		"party_type",
+		"party",
+		"account_currency",
+		"exchange_rate",
+		"reference_type",
+		"against_voucher_type",
+		"against_voucher",
+		"is_advance",
+		"user_remark",
+	]
+
+	return tuple(str(row.get(fieldname) or "") for fieldname in base_fields + dimension_fields)
+
+
+def _asset_split_snapshot_rows(journal_entry):
+	snapshot = {}
+
+	for row in journal_entry.get("accounts"):
+		snapshot[row.name or row.idx] = {
+			"name": row.name,
+			"idx": row.idx,
+			"reference_type": row.reference_type,
+			"reference_name": row.reference_name,
+			"side": _asset_split_amount_side(row),
+			"amount": _asset_split_row_amount(row),
+			"amount_in_account_currency": _asset_split_row_amount_in_account_currency(row),
+			"identity": _asset_split_row_identity(row),
+		}
+
+	return snapshot
+
+
+def _asset_split_je_fingerprint(journal_entry):
+	dimension_fields = _get_accounting_dimension_fields_for_asset_split()
+
+	base_fields = [
+		"account",
+		"cost_center",
+		"project",
+		"finance_book",
+		"party_type",
+		"party",
+		"account_currency",
+		"exchange_rate",
+		"reference_type",
+		"against_voucher_type",
+		"against_voucher",
+	]
+
+	total_debit = 0
+	total_credit = 0
+	buckets = {}
+
+	for row in journal_entry.get("accounts"):
+		total_debit += flt(row.debit)
+		total_credit += flt(row.credit)
+
+		key = tuple(str(row.get(fieldname) or "") for fieldname in base_fields + dimension_fields)
+
+		if key not in buckets:
+			buckets[key] = {"debit": 0, "credit": 0}
+
+		buckets[key]["debit"] += flt(row.debit)
+		buckets[key]["credit"] += flt(row.credit)
+
+	return {
+		"total_debit": flt(total_debit, 6),
+		"total_credit": flt(total_credit, 6),
+		"buckets": {
+			key: {
+				"debit": flt(value["debit"], 6),
+				"credit": flt(value["credit"], 6),
+			}
+			for key, value in buckets.items()
+		},
+	}
+
+
+def _validate_asset_split_reallocation_rows(
+	journal_entry,
+	before_snapshot,
+	new_asset_name,
+	depreciation_amount,
+	original_old_row_keys,
+	new_rows_added,
+):
+	after_rows_by_key = {row.name or row.idx: row for row in journal_entry.get("accounts")}
+
+	for key, before in before_snapshot.items():
+		after = after_rows_by_key.get(key)
+
+		if not after:
+			frappe.throw(_("Unsafe Asset Split blocked. Existing JE row disappeared."))
+
+		if _asset_split_row_identity(after) != before["identity"]:
+			frappe.throw(_("Unsafe Asset Split blocked. Existing JE row accounting fields changed."))
+
+		if after.reference_type != before["reference_type"]:
+			frappe.throw(_("Unsafe Asset Split blocked. Existing JE row reference type changed."))
+
+		if after.reference_name != before["reference_name"]:
+			frappe.throw(_("Unsafe Asset Split blocked. Existing JE row reference name changed."))
+
+		before_amount = flt(before["amount"])
+		after_amount = _asset_split_row_amount(after)
+
+		before_amount_currency = flt(before["amount_in_account_currency"])
+		after_amount_currency = _asset_split_row_amount_in_account_currency(after)
+
+		if key in original_old_row_keys:
+			expected_amount = flt(before_amount - depreciation_amount, 6)
+			expected_amount_currency = flt(
+				before_amount_currency - flt(after.exchange_rate) * depreciation_amount,
+				6,
+			)
+
+			if expected_amount < 0 or expected_amount_currency < 0:
+				frappe.throw(_("Unsafe Asset Split blocked. Reallocation would create a negative amount."))
+
+			if flt(after_amount, 6) != expected_amount:
+				frappe.throw(_("Unsafe Asset Split blocked. Old asset row was not reduced correctly."))
+
+			if flt(after_amount_currency, 6) != expected_amount_currency:
+				frappe.throw(
+					_("Unsafe Asset Split blocked. Old asset account-currency amount was not reduced correctly.")
+				)
+		else:
+			if flt(after_amount, 6) != flt(before_amount, 6):
+				frappe.throw(_("Unsafe Asset Split blocked. Unrelated JE row amount changed."))
+
+			if flt(after_amount_currency, 6) != flt(before_amount_currency, 6):
+				frappe.throw(
+					_("Unsafe Asset Split blocked. Unrelated JE row account-currency amount changed.")
+				)
+
+	if len(new_rows_added) != len(original_old_row_keys):
+		frappe.throw(_("Unsafe Asset Split blocked. New split rows do not match old asset rows."))
+
+	for source_key, new_row in new_rows_added:
+		source = before_snapshot[source_key]
+
+		if new_row.reference_type != source["reference_type"]:
+			frappe.throw(_("Unsafe Asset Split blocked. New row reference type does not match source row."))
+
+		if new_row.reference_name != new_asset_name:
+			frappe.throw(_("Unsafe Asset Split blocked. New row does not reference the new split asset."))
+
+		if _asset_split_row_identity(new_row) != source["identity"]:
+			frappe.throw(_("Unsafe Asset Split blocked. New row accounting fields differ from source row."))
+
+		if _asset_split_amount_side(new_row) != source["side"]:
+			frappe.throw(_("Unsafe Asset Split blocked. New row debit/credit side differs from source row."))
+
+		if flt(_asset_split_row_amount(new_row), 6) != flt(depreciation_amount, 6):
+			frappe.throw(_("Unsafe Asset Split blocked. New row amount is not the expected split amount."))
+
+		expected_amount_currency = flt(flt(new_row.exchange_rate) * depreciation_amount, 6)
+
+		if flt(_asset_split_row_amount_in_account_currency(new_row), 6) != expected_amount_currency:
+			frappe.throw(
+				_("Unsafe Asset Split blocked. New row account-currency amount is not the expected split amount.")
+			)
+
+
 def add_reference_in_jv_on_split(entry_name, new_asset_name, old_asset_name, depreciation_amount):
 	journal_entry = frappe.get_doc("Journal Entry", entry_name)
-	entries_to_add = []
+
+	if journal_entry.voucher_type != "Depreciation Entry":
+		frappe.throw(
+			_("Asset Split closed-period bypass is only allowed for Depreciation Entry Journal Entries.")
+		)
+
+	split_from = frappe.db.get_value("Asset", new_asset_name, "split_from")
+	if split_from != old_asset_name:
+		frappe.throw(
+			_("New Asset {0} is not linked to old Asset {1} using split_from.").format(
+				new_asset_name,
+				old_asset_name,
+			)
+		)
+
+	old_rows = [
+		row for row in journal_entry.get("accounts")
+		if row.reference_name == old_asset_name
+		and (not row.reference_type or row.reference_type == "Asset")
+	]
+
+	if not old_rows:
+		frappe.throw(
+			_("No Journal Entry account rows found for old Asset {0} in Journal Entry {1}.").format(
+				old_asset_name,
+				entry_name,
+			)
+		)
+
+	for row in old_rows:
+		_asset_split_validate_exchange_rate(row)
+
+		current_amount = _asset_split_row_amount(row)
+		current_amount_currency = _asset_split_row_amount_in_account_currency(row)
+
+		if flt(current_amount, 6) < flt(depreciation_amount, 6):
+			frappe.throw(
+				_(
+					"Cannot reallocate {0} from Asset {1}; JE row only has {2}. "
+					"This would create a negative amount."
+				).format(depreciation_amount, old_asset_name, current_amount)
+			)
+
+		required_currency_amount = flt(flt(row.exchange_rate) * depreciation_amount, 6)
+
+		if flt(current_amount_currency, 6) < required_currency_amount:
+			frappe.throw(
+				_(
+					"Cannot reallocate {0} from Asset {1}; JE row account-currency amount is insufficient."
+				).format(depreciation_amount, old_asset_name)
+			)
+
+	before_fingerprint = _asset_split_je_fingerprint(journal_entry)
+	before_snapshot = _asset_split_snapshot_rows(journal_entry)
+
+	original_old_row_keys = set(row.name or row.idx for row in old_rows)
+	new_rows_added = []
+
 	idx = len(journal_entry.get("accounts")) + 1
 
-	for account in journal_entry.get("accounts"):
-		if account.reference_name == old_asset_name:
-			entries_to_add.append(frappe.copy_doc(account).as_dict())
-			if account.credit:
-				account.credit = account.credit - depreciation_amount
-				account.credit_in_account_currency = (
-					account.credit_in_account_currency - account.exchange_rate * depreciation_amount
-				)
-			elif account.debit:
-				account.debit = account.debit - depreciation_amount
-				account.debit_in_account_currency = (
-					account.debit_in_account_currency - account.exchange_rate * depreciation_amount
-				)
+	for account in old_rows:
+		source_key = account.name or account.idx
 
-	for entry in entries_to_add:
-		entry.reference_name = new_asset_name
-		if entry.credit:
-			entry.credit = depreciation_amount
-			entry.credit_in_account_currency = entry.exchange_rate * depreciation_amount
-		elif entry.debit:
-			entry.debit = depreciation_amount
-			entry.debit_in_account_currency = entry.exchange_rate * depreciation_amount
+		if account.credit:
+			account.credit = flt(account.credit - depreciation_amount, 6)
+			account.credit_in_account_currency = flt(
+				account.credit_in_account_currency - account.exchange_rate * depreciation_amount,
+				6,
+			)
+		elif account.debit:
+			account.debit = flt(account.debit - depreciation_amount, 6)
+			account.debit_in_account_currency = flt(
+				account.debit_in_account_currency - account.exchange_rate * depreciation_amount,
+				6,
+			)
+		else:
+			frappe.throw(_("Cannot reallocate Asset Split amount from a zero-value JE row."))
 
-		entry.idx = idx
+		new_row = frappe.copy_doc(account).as_dict()
+		new_row["name"] = None
+		new_row.reference_name = new_asset_name
+
+		if new_row.credit:
+			new_row.credit = depreciation_amount
+			new_row.credit_in_account_currency = flt(new_row.exchange_rate * depreciation_amount, 6)
+		elif new_row.debit:
+			new_row.debit = depreciation_amount
+			new_row.debit_in_account_currency = flt(new_row.exchange_rate * depreciation_amount, 6)
+
+		new_row.idx = idx
 		idx += 1
 
-		journal_entry.append("accounts", entry)
+		journal_entry.append("accounts", new_row)
+		new_rows_added.append((source_key, journal_entry.get("accounts")[-1]))
+
+	_validate_asset_split_reallocation_rows(
+		journal_entry,
+		before_snapshot,
+		new_asset_name,
+		depreciation_amount,
+		original_old_row_keys,
+		new_rows_added,
+	)
+
+	after_fingerprint = _asset_split_je_fingerprint(journal_entry)
+
+	if before_fingerprint != after_fingerprint:
+		frappe.throw(
+			_(
+				"Unsafe Asset Split blocked for Journal Entry {0}. "
+				"Financial totals/accounts/dimensions changed while reallocating depreciation "
+				"from Asset {1} to Asset {2}."
+			).format(entry_name, old_asset_name, new_asset_name)
+		)
 
 	journal_entry.flags.ignore_validate_update_after_submit = True
 	journal_entry.save()
 
-	# Repost GL Entries
-	journal_entry.docstatus = 2
-	journal_entry.make_gl_entries(1)
-	journal_entry.docstatus = 1
-	journal_entry.make_gl_entries()
+	frappe.flags.asset_split_closed_period_reallocation = {
+		"journal_entry": entry_name,
+		"old_asset": old_asset_name,
+		"new_asset": new_asset_name,
+	}
+
+	try:
+		frappe.logger("asset_split_closed_period").info(
+			"Closed-period bypass used for Asset Split depreciation reallocation. "
+			f"Journal Entry: {entry_name}, Old Asset: {old_asset_name}, New Asset: {new_asset_name}"
+		)
+
+		journal_entry.docstatus = 2
+		journal_entry.make_gl_entries(1)
+
+		journal_entry.docstatus = 1
+		journal_entry.make_gl_entries()
+
+		journal_entry.add_comment(
+			"Comment",
+			_(
+				"Asset Split depreciation reallocation completed with closed-period safety check. "
+				"Old Asset: {0}. New Asset: {1}. Financial totals unchanged; only asset reference allocation changed."
+			).format(old_asset_name, new_asset_name),
+		)
+	finally:
+		frappe.flags.asset_split_closed_period_reallocation = None
